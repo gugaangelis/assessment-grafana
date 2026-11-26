@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Saídas do assessment (confidenciais: nomes de dashboards, fontes, usuários)
+grafana-assessment-*/
+*.zip
+assessment.log
