@@ -88,8 +88,14 @@ $env:GRAFANA_USER = 'vertare'
 
 ### 4.2 Testar conexão e permissões (sempre fazer primeiro)
 
+**bash:**
 ```bash
 python3 grafana_assessment.py --test
+```
+
+**PowerShell:**
+```powershell
+py .\grafana_assessment.py --test
 ```
 
 Saída esperada (exemplo):
@@ -113,8 +119,14 @@ Endpoints (org atual 1):
 
 ### 4.3 Rodar o assessment
 
+**bash:**
 ```bash
 python3 grafana_assessment.py --customer "Assaí Atacadista" --env-name "Produção" --days 30 --expected-integrations zabbix
+```
+
+**PowerShell:**
+```powershell
+py .\grafana_assessment.py --customer "Assaí Atacadista" --env-name "Produção" --days 30 --expected-integrations zabbix
 ```
 
 Durante a execução o progresso é exibido com horário (`[HH:MM:SS] [Main Org.] fontes de dados...`, `pastas e dashboards...`, `histórico de estados de alerta (30 dias)...` etc.). Ao final:
@@ -137,19 +149,46 @@ Durante a execução o progresso é exibido com horário (`[HH:MM:SS] [Main Org.
 | Validar integrações esperadas | `--expected-integrations zabbix,servicenow,teams` |
 | Pasta de saída específica | `--out ./saida-assai` |
 
-Exemplo combinado:
+Os parâmetros são os mesmos nos dois shells; muda só a forma de chamar o Python e a quebra de linha (`\` no bash, `` ` `` no PowerShell, sem espaço depois).
+
+Exemplo combinado (jump server com CA interna, sem proxy e sem PDF/PPTX):
+
+**bash:**
 ```bash
 python3 grafana_assessment.py --insecure --no-proxy --formats none \
   --customer "Assaí Atacadista" --env-name "Produção" --days 30 --expected-integrations zabbix
 ```
+
+**PowerShell:**
+```powershell
+py .\grafana_assessment.py --insecure --no-proxy --formats none `
+  --customer "Assaí Atacadista" --env-name "Produção" --days 30 --expected-integrations zabbix
+```
+
+Exemplos por cenário:
+
+| Cenário | bash | PowerShell |
+|---|---|---|
+| CA interna | `python3 grafana_assessment.py --ca-bundle /certs/ca.pem` | `py .\grafana_assessment.py --ca-bundle C:\certs\ca.pem` |
+| Só algumas orgs | `python3 grafana_assessment.py --orgs "Main Org.,NOC*"` | `py .\grafana_assessment.py --orgs "Main Org.,NOC*"` |
+| Sem health check | `python3 grafana_assessment.py --skip-ds-health` | `py .\grafana_assessment.py --skip-ds-health` |
+| Ambiente grande | `python3 grafana_assessment.py --max-dashboards 2000 --timeout 120 --threads 2` | `py .\grafana_assessment.py --max-dashboards 2000 --timeout 120 --threads 2` |
+| Pasta de saída | `python3 grafana_assessment.py --out ./saida-assai` | `py .\grafana_assessment.py --out .\saida-assai` |
 
 ### 4.5 Gerar PDF/PPTX fora do jump server (`--render-only`)
 
 1. No jump server, coletar sem PDF/PPTX: `--formats none`.
 2. Copiar a pasta de saída (ou só o `dados.json`) para a sua máquina, por canal aprovado.
 3. Na sua máquina (com `pip install --user reportlab python-pptx`):
+
+   **bash:**
    ```bash
    python3 grafana_assessment.py --render-only ./grafana-assessment-20261126-1600/dados.json --customer "Assaí Atacadista"
+   ```
+
+   **PowerShell:**
+   ```powershell
+   py .\grafana_assessment.py --render-only .\grafana-assessment-20261126-1600\dados.json --customer "Assaí Atacadista"
    ```
    Não conecta no Grafana. Regera **todos** os arquivos (HTML, CSV, PDF, PPTX) na mesma pasta do JSON (ou em `--out`).
 
@@ -402,6 +441,7 @@ Erros HTTP 429/5xx e falhas de rede transitórias são **repetidos automaticamen
 
 ## 11. Referências rápidas de comandos
 
+**Linux / jump server (bash):**
 ```bash
 # ajuda completa dos parâmetros
 python3 grafana_assessment.py --help
@@ -417,17 +457,46 @@ python3 grafana_assessment.py --test
 python3 grafana_assessment.py --customer "Assaí Atacadista" --env-name "Produção" --days 30 --expected-integrations zabbix
 
 # jump server restrito (CA interna, sem proxy, sem PDF/PPTX)
-python3 grafana_assessment.py --insecure --no-proxy --formats none --customer "Assaí Atacadista"
+python3 grafana_assessment.py --insecure --no-proxy --formats none --customer "Assaí Atacadista" --expected-integrations zabbix
+
+# salvar o log da execução
+python3 grafana_assessment.py --customer "Assaí Atacadista" 2>&1 | tee assessment.log
 
 # regerar relatórios a partir da coleta
 python3 grafana_assessment.py --render-only ./grafana-assessment-20261126-1600/dados.json --customer "Assaí Atacadista"
+
+# empacotar o resultado e limpar a sessão
+tar czf grafana-assessment-20261126-1600.tgz grafana-assessment-20261126-1600/
+unset GRAFANA_PASSWORD GRAFANA_USER GRAFANA_URL GRAFANA_CA_BUNDLE
 ```
 
 **Windows (PowerShell):** detalhes na [seção 5](#5-execução-no-windows-powershell).
 ```powershell
+# ajuda completa dos parâmetros
+py .\grafana_assessment.py --help
+
+# variáveis (Assaí)
 $env:GRAFANA_URL  = 'https://grafana.corp.assai.com.br/'
 $env:GRAFANA_USER = 'vertare'
+
+# teste de conexão (pede a senha)
 py .\grafana_assessment.py --test
+
+# execução padrão
 py .\grafana_assessment.py --customer "Assaí Atacadista" --env-name "Produção" --days 30 --expected-integrations zabbix
-Remove-Item Env:GRAFANA_PASSWORD, Env:GRAFANA_USER, Env:GRAFANA_URL -ErrorAction SilentlyContinue
+
+# jump server restrito (CA interna, sem proxy, sem PDF/PPTX)
+py .\grafana_assessment.py --insecure --no-proxy --formats none --customer "Assaí Atacadista" --expected-integrations zabbix
+
+# salvar o log da execução (PowerShell 7+)
+py .\grafana_assessment.py --customer "Assaí Atacadista" 2>&1 | Tee-Object -FilePath .\assessment.log
+
+# regerar relatórios a partir da coleta
+py .\grafana_assessment.py --render-only .\grafana-assessment-20261126-1600\dados.json --customer "Assaí Atacadista"
+
+# empacotar o resultado e limpar a sessão
+Compress-Archive -Path .\grafana-assessment-20261126-1600 -DestinationPath .\grafana-assessment-20261126-1600.zip
+Remove-Item Env:GRAFANA_PASSWORD, Env:GRAFANA_USER, Env:GRAFANA_URL, Env:GRAFANA_CA_BUNDLE -ErrorAction SilentlyContinue
 ```
+
+> Se `python3`/`py` não existir na máquina, use `python` no lugar (ex.: `python grafana_assessment.py --test`).
