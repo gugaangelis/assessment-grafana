@@ -22,7 +22,7 @@ A avaliação é organizada em **5 pilares** e 18 domínios (~85 controles):
 ### Garantia de somente leitura
 
 - O cliente HTTP do script **só implementa GET** e só em caminhos `/api/...`. Proxy de fonte de dados (`/api/datasources/proxy`), `/api/ds/*` e recursos de plugin são bloqueados **antes** de sair da máquina (`PermissionError`). Não existe código de POST/PUT/PATCH/DELETE.
-- Autenticação por usuário/senha usa **HTTP Basic** em cada chamada: não cria sessão, não há logout a fazer.
+- Autenticação por **token de API** (header `Authorization: Bearer`) em cada chamada: não cria sessão, não há logout a fazer.
 - **Único efeito colateral:** o health check das fontes de dados (`GET /api/datasources/uid/<uid>/health`) executa a consulta de teste de cada fonte (a mesma do botão *Save & test*, sem salvar). Para não executar: `--skip-ds-health`.
 - O Grafana OSS **não tem** papel de administrador somente leitura; por isso a garantia de read-only é do script. O script **não altera nada** no Grafana, nem grava arquivos fora da pasta de saída.
 
@@ -36,32 +36,53 @@ A avaliação é organizada em **5 pilares** e 18 domínios (~85 controles):
 | Bibliotecas para a coleta | **Nenhuma**: usa só a biblioteca padrão. Roda em jump server sem internet/pip. |
 | Bibliotecas opcionais (PDF/PPTX) | `pip install --user reportlab python-pptx`. Sem elas, PDF e PPTX são **pulados** (o restante é gerado normalmente). |
 | Rede | Acesso HTTPS da máquina de execução até o Grafana. Normalmente via jump server ou VPN. |
-| Credencial | Usuário/senha com as permissões da seção 3 (recomendado) **ou** service account token (cobertura parcial). |
+| Credencial | **Token de API** de uma service account com papel Admin (seção 3). Usuário/senha continua aceito como alternativa. |
 
 ---
 
-## 3. Preparação da credencial no Grafana (feita pelo administrador do cliente)
+## 3. Preparação do token no Grafana (feita pelo administrador do cliente)
 
-Ambiente Assaí: **URL** `https://grafana.corp.assai.com.br/` · **usuário** `vertare`.
+Ambiente Assaí: **URL** `https://grafana.corp.assai.com.br/` · autenticação por **token de API**.
+
+### 3.1 Criar a service account e o token
+
+1. *Administration → Users and access → Service accounts → Add service account*.
+2. **Display name:** `vertare-assessment` (sugestão) · **Role:** **Admin**.
+3. Na service account criada: *Add service account token* → defina **Expiration** (ex.: 7 dias, o tempo do assessment) → *Generate token*.
+4. Copie o token (começa com `glsa_`): ele **só é exibido uma vez**. Envie por canal seguro (cofre/gerenciador de senhas), nunca por e-mail ou chat em texto aberto.
 
 | Configuração | Valor | Para quê |
 |---|---|---|
-| Grafana Admin (server admin) | **Sim** (*Administration → Users → vertare → Grafana Admin*) | Configuração do servidor (`/api/admin/settings`), estatísticas, usuários e lista de organizações |
-| Papel em cada organização avaliada | **Admin** (*Administration → Users → vertare → Organizations*) | Fontes de dados, alerting (contact points, políticas, silêncios), usuários da org, times, service accounts, permissões de pastas |
-| Basic auth | `[auth.basic] enabled = true` (padrão) | Login por usuário/senha na API |
-| Tipo de conta | Local ou LDAP | Conta só OAuth/SAML (Entra ID, Okta…) **não** autentica por Basic auth |
+| Role da service account | **Admin** na organização avaliada | Fontes de dados, alerting (contact points, políticas, silêncios), usuários da org, times, service accounts, permissões de pastas |
+| Expiração do token | Curta (ex.: 7 dias) | Token esquecido deixa de funcionar sozinho |
+| Organização | A que será avaliada | O token vale **só** para a organização onde a service account foi criada |
 
-- O usuário precisa ser **membro** de cada organização a avaliar: o script lê uma org por vez com o header `X-Grafana-Org-Id`. Organizações em que ele não é membro aparecem como "sem acesso" no relatório.
-- **Grafana Enterprise/Cloud:** em vez de Admin, pode-se criar uma role RBAC customizada só com ações `*:read` (datasources:read, alert.*:read, users:read, teams:read, serviceaccounts:read, settings:read, server.stats:read, folders.permissions:read…).
-- Recomendação: conta **exclusiva** para o assessment, **desabilitada ao final** (seção 10).
+> Grafana 8.x ou anterior (sem service accounts): use uma **API key** com papel Admin (*Configuration → API keys*). O script aceita da mesma forma.
 
-> Com papel **Editor** ou **Viewer**, ou sem Grafana Admin, o assessment roda, mas os coletores restritos aparecem como **"parcial"** no apêndice do relatório e os controles dependentes ficam **N/A** (não penalizam o score, mas reduzem a cobertura da análise).
+### 3.2 O que o token cobre (e o que não cobre)
 
-> ⚠️ **Brute force:** o Grafana bloqueia o login após **5 senhas erradas em 5 minutos**. O script valida a credencial com **uma** chamada antes de qualquer paralelismo e para no primeiro HTTP 401. Se der 401, confira a senha antes de tentar de novo.
+Service accounts **não podem ser Grafana Admin (server admin)**. Por isso, com token:
 
-### Alternativa: service account token
+| Item | Com token (Admin da org) |
+|---|---|
+| Dashboards, pastas, painéis, library panels | ✅ |
+| Fontes de dados e health check | ✅ |
+| Regras de alerta, contact points, políticas, silêncios, histórico | ✅ |
+| Usuários da org, times, service accounts, tokens, API keys, permissões | ✅ |
+| Dashboards públicos, snapshots, plugins, versão | ✅ |
+| Configuração do servidor (`/api/admin/settings`) e estatísticas | ❌ HTTP 403 → controles N/A |
+| Usuários globais e lista de todas as organizações | ❌ HTTP 403 → controles N/A |
+| Outras organizações | ❌ um token por organização |
 
-`GRAFANA_TOKEN` com um token de service account (papel Admin) funciona, mas service accounts não podem ser Grafana Admin e valem para **uma** organização: a configuração do servidor, os usuários globais e as outras orgs ficam N/A. Use só se a conta de usuário não for possível.
+- Os itens ❌ aparecem como **"parcial"** no apêndice de coleta e os controles dependentes ficam **N/A**: não penalizam o score, só reduzem a cobertura. O `--test` mostra esses endpoints como `NEGADO` e avisa que é esperado.
+- **Várias organizações:** gere um token em cada org e rode o assessment uma vez por token, com `--out` diferente em cada execução.
+- **Grafana Enterprise/Cloud:** em vez de Admin, pode-se criar uma role RBAC customizada só com ações `*:read` (datasources:read, alert.*:read, users:read, teams:read, serviceaccounts:read, folders.permissions:read…) e atribuí-la à service account.
+- Com papel **Editor** ou **Viewer** o assessment roda, mas mais coletores ficam "parcial" e mais controles N/A.
+- Ao final, **revogue o token** e apague a service account (seção 10).
+
+### 3.3 Alternativa: usuário e senha
+
+Para cobrir também a configuração do servidor, os usuários globais e todas as organizações numa execução só, use um usuário (local ou LDAP) com **Grafana Admin = Sim** e papel **Admin** em cada org, definindo `GRAFANA_USER` (a senha é pedida no prompt ou lida de `GRAFANA_PASSWORD`). Requer `[auth.basic] enabled = true`; contas só OAuth/SAML não funcionam. Atenção: o Grafana bloqueia o login após 5 senhas erradas em 5 minutos. Se `GRAFANA_TOKEN` estiver definido, ele tem prioridade.
 
 ---
 
@@ -69,20 +90,24 @@ Ambiente Assaí: **URL** `https://grafana.corp.assai.com.br/` · **usuário** `v
 
 ### 4.1 Definir as variáveis de ambiente
 
-Prefira variáveis de ambiente a parâmetros na linha de comando, e **não defina a senha em variável**: o script pede no prompt, sem exibi-la.
+Defina a URL em variável. Para o token há duas opções seguras: **(a)** não definir nada e colar o token quando o script pedir (entrada oculta, não vai para o histórico), ou **(b)** ler o token sem exibi-lo para a variável `GRAFANA_TOKEN` (evita colar de novo a cada execução). **Nunca** passe `--token glsa_...` nem digite `GRAFANA_TOKEN='glsa_...'` direto no comando: ficaria no histórico do shell.
 
 **Linux / jump server (bash):**
 ```bash
 export GRAFANA_URL='https://grafana.corp.assai.com.br/'
-export GRAFANA_USER='vertare'
-# senha: o script pede no prompt (recomendado). Alternativa: read -rs GRAFANA_PASSWORD && export GRAFANA_PASSWORD
+# (b) token em variável, colado sem eco:
+read -rs -p 'Token do Grafana: ' GRAFANA_TOKEN && export GRAFANA_TOKEN && echo
 ```
 
 **Windows (PowerShell):** ver o guia completo na [seção 5](#5-execução-no-windows-powershell).
 ```powershell
-$env:GRAFANA_URL  = 'https://grafana.corp.assai.com.br/'
-$env:GRAFANA_USER = 'vertare'
+$env:GRAFANA_URL = 'https://grafana.corp.assai.com.br/'
+# (b) token em variável, colado sem eco:
+$sec = Read-Host 'Token do Grafana' -AsSecureString
+$env:GRAFANA_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 ```
+
+> Sem `GRAFANA_TOKEN` (e sem `GRAFANA_USER`), o script pede: `Token de API do Grafana (service account glsa_... ; entrada oculta):`. O token pode ser colado com ou sem o prefixo `Bearer `.
 
 > A URL é a mesma do navegador (raiz do Grafana). Se o Grafana estiver publicado em subcaminho (ex.: `https://host/grafana/`), use a URL com o subcaminho.
 
@@ -101,21 +126,25 @@ py .\grafana_assessment.py --test
 Saída esperada (exemplo):
 ```
 Conectado: https://grafana.corp.assai.com.br
-Versão: 11.6.1 (Open Source) · suporte limitado · autenticação: usuario_senha · banco: ok
-Usuário: vertare · Grafana Admin (server admin): sim
+Versão: 11.6.1 (Open Source) · suporte limitado · autenticação: token_api · banco: ok
+Identidade (service account): sa-1-vertare-assessment · Grafana Admin (server admin): NÃO
   org 1: Main Org. · papel Admin
 Endpoints (org atual 1):
   /api/user                                            OK  · identidade do usuário
-  /api/admin/settings                                  OK  · config do servidor · requer Grafana Admin
+  /api/admin/settings                                  NEGADO HTTP 403 ...  · config do servidor · requer Grafana Admin
+  /api/admin/stats                                     NEGADO HTTP 403 ...  · estatísticas · requer Grafana Admin
+  /api/users/search                                    NEGADO HTTP 403 ...  · usuários · requer Grafana Admin
+  /api/orgs                                            NEGADO HTTP 403 ...  · todas as orgs · requer Grafana Admin
   /api/datasources                                     OK  (12 itens)  · fontes de dados · requer Admin da org
   ...
-  /api/v1/sso-settings                                 OK  · SSO (11.x+)
+Token de API: escopo de 1 organização e sem Grafana Admin. NEGADO em /api/admin/*, /api/users/search e /api/orgs é esperado (...)
 ```
 
 - `OK` → endpoint acessível.
 - `n/a` (HTTP 404) → normal: o endpoint não existe naquela versão/edição ou o recurso está desabilitado.
-- `NEGADO` (HTTP 401/403) → falta permissão. Ajustar o usuário (seção 3) **antes** de seguir, ou seguir ciente de que parte da análise ficará parcial.
-- Linha `<- recomendado Admin` ao lado de uma org → o usuário não é Admin naquela organização.
+- `NEGADO` em `/api/admin/*`, `/api/users/search` e `/api/orgs` → **esperado com token** (seção 3.2).
+- `NEGADO` em outros endpoints (ex.: `/api/datasources`, contact points, service accounts) → a service account não é Admin. Ajustar a role (seção 3.1) **antes** de seguir, ou seguir ciente de que parte da análise ficará parcial.
+- Linha `<- recomendado Admin` ao lado da org → a service account não tem papel Admin.
 
 ### 4.3 Rodar o assessment
 
@@ -143,7 +172,7 @@ Durante a execução o progresso é exibido com horário (`[HH:MM:SS] [Main Org.
 | Certificado interno / self-signed | `--ca-bundle /caminho/ca.pem` (preferível) ou `--insecure` |
 | Proxy HTTP corporativo atrapalhando o acesso via VPN | `--no-proxy` |
 | Jump server sem `reportlab`/`python-pptx` | `--formats none` (depois gerar PDF/PPTX em outra máquina, ver 4.5) |
-| Avaliar só algumas organizações | `--orgs "Main Org.,NOC*"` (nome com curinga ou ID) |
+| Mais de uma organização | Um token por org; rodar uma vez por token com `--out` diferente (ver abaixo) |
 | Não executar o health check das fontes | `--skip-ds-health` |
 | Muitos dashboards / API lenta | `--max-dashboards 2000`, `--timeout 120` e manter `--threads 4` (ou reduzir para 2) |
 | Validar integrações esperadas | `--expected-integrations zabbix,servicenow,teams` |
@@ -170,10 +199,31 @@ Exemplos por cenário:
 | Cenário | bash | PowerShell |
 |---|---|---|
 | CA interna | `python3 grafana_assessment.py --ca-bundle /certs/ca.pem` | `py .\grafana_assessment.py --ca-bundle C:\certs\ca.pem` |
-| Só algumas orgs | `python3 grafana_assessment.py --orgs "Main Org.,NOC*"` | `py .\grafana_assessment.py --orgs "Main Org.,NOC*"` |
 | Sem health check | `python3 grafana_assessment.py --skip-ds-health` | `py .\grafana_assessment.py --skip-ds-health` |
 | Ambiente grande | `python3 grafana_assessment.py --max-dashboards 2000 --timeout 120 --threads 2` | `py .\grafana_assessment.py --max-dashboards 2000 --timeout 120 --threads 2` |
 | Pasta de saída | `python3 grafana_assessment.py --out ./saida-assai` | `py .\grafana_assessment.py --out .\saida-assai` |
+
+**Mais de uma organização** (o token só enxerga a org da service account): troque o token e a pasta de saída a cada org.
+
+**bash:**
+```bash
+read -rs -p 'Token do Grafana: ' GRAFANA_TOKEN && export GRAFANA_TOKEN && echo   # token da org "Main Org."
+python3 grafana_assessment.py --env-name "Produção - Main Org." --out ./assessment-main
+read -rs -p 'Token do Grafana: ' GRAFANA_TOKEN && export GRAFANA_TOKEN && echo   # token da org "NOC"
+python3 grafana_assessment.py --env-name "Produção - NOC" --out ./assessment-noc
+```
+
+**PowerShell:**
+```powershell
+$sec = Read-Host 'Token do Grafana' -AsSecureString
+$env:GRAFANA_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+Remove-Variable sec      # token da org "Main Org."
+py .\grafana_assessment.py --env-name "Produção - Main Org." --out .\assessment-main
+$sec = Read-Host 'Token do Grafana' -AsSecureString
+$env:GRAFANA_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+Remove-Variable sec      # token da org "NOC"
+py .\grafana_assessment.py --env-name "Produção - NOC" --out .\assessment-noc
+```
 
 ### 4.5 Gerar PDF/PPTX fora do jump server (`--render-only`)
 
@@ -220,19 +270,17 @@ Get-ChildItem .\grafana_assessment.py
 As variáveis `$env:` valem **só para a janela atual** do PowerShell.
 
 ```powershell
-$env:GRAFANA_URL  = 'https://grafana.corp.assai.com.br/'
-$env:GRAFANA_USER = 'vertare'
-# não defina GRAFANA_PASSWORD: o script pede a senha no prompt, sem exibi-la
+$env:GRAFANA_URL = 'https://grafana.corp.assai.com.br/'
 ```
 
-Se precisar da senha em variável (ex.: execução agendada), leia sem exibir:
+Token: **ou** não defina nada e cole quando o script pedir (entrada oculta), **ou** leia sem exibir para a variável (recomendado quando for rodar `--test` e depois a coleta):
 ```powershell
-$sec = Read-Host 'Senha do Grafana' -AsSecureString
-$env:GRAFANA_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+$sec = Read-Host 'Token do Grafana' -AsSecureString
+$env:GRAFANA_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 Remove-Variable sec
 ```
 
-> ⚠️ **Nunca digite a senha direto no comando** (`$env:GRAFANA_PASSWORD = 'abc...'`): o PowerShell grava os comandos no histórico (`(Get-PSReadLineOption).HistorySavePath`). O que é digitado no `Read-Host` não é gravado.
+> ⚠️ **Nunca digite o token direto no comando** (`$env:GRAFANA_TOKEN = 'glsa_...'` ou `--token glsa_...`): o PowerShell grava os comandos no histórico (`(Get-PSReadLineOption).HistorySavePath`). O que é digitado no `Read-Host` não é gravado.
 
 **CA interna** (alternativa ao `--insecure`):
 ```powershell
@@ -293,14 +341,19 @@ Get-ChildItem Env: | Where-Object Name -match 'proxy'         # há proxy no amb
 
 # chamada anônima (não usa credencial): deve retornar {"database":"ok", ...}
 Invoke-RestMethod -Uri "$($env:GRAFANA_URL.TrimEnd('/'))/api/health"
+
+# chamada autenticada com o token (somente leitura): deve retornar id e nome da organização
+Invoke-RestMethod -Uri "$($env:GRAFANA_URL.TrimEnd('/'))/api/org" -Headers @{ Authorization = "Bearer $env:GRAFANA_TOKEN" }
 ```
+
+Equivalente em bash: `curl -s -H "Authorization: Bearer $GRAFANA_TOKEN" "${GRAFANA_URL%/}/api/org"`.
 
 - No PowerShell 7+, com certificado de CA interna, adicione `-SkipCertificateCheck` ao `Invoke-RestMethod`.
 
 ### 5.8 Limpeza ao final
 
 ```powershell
-Remove-Item Env:GRAFANA_PASSWORD, Env:GRAFANA_TOKEN, Env:GRAFANA_USER, Env:GRAFANA_URL, Env:GRAFANA_CA_BUNDLE -ErrorAction SilentlyContinue
+Remove-Item Env:GRAFANA_TOKEN, Env:GRAFANA_USER, Env:GRAFANA_PASSWORD, Env:GRAFANA_URL, Env:GRAFANA_CA_BUNDLE -ErrorAction SilentlyContinue
 # após copiar o resultado, apague a saída da máquina (confira o caminho antes)
 Remove-Item -Recurse -Force $out.FullName
 Remove-Item -Force "$($out.FullName).zip" -ErrorAction SilentlyContinue
@@ -313,15 +366,15 @@ Remove-Item -Force "$($out.FullName).zip" -ErrorAction SilentlyContinue
 | Parâmetro | Variável de ambiente | Padrão | Descrição |
 |---|---|---|---|
 | `--url` | `GRAFANA_URL` | — | URL do Grafana (a mesma do navegador). Obrigatório (exceto `--render-only`). |
-| `--user` | `GRAFANA_USER` | — | Usuário; senha via `GRAFANA_PASSWORD` ou prompt (recomendado). |
-| `--token` | `GRAFANA_TOKEN` | — | Service account token (alternativa; cobertura parcial). Tem prioridade sobre `--user`. |
+| `--token` | `GRAFANA_TOKEN` | prompt oculto | **Token de API** (service account `glsa_...` ou API key). Se nenhuma credencial for informada, o script pede o token. Prefira a variável ou o prompt ao parâmetro (histórico do shell). Tem prioridade sobre `--user`. |
+| `--user` | `GRAFANA_USER` | — | Alternativa ao token: usuário; senha via `GRAFANA_PASSWORD` ou prompt. |
 | `--ca-bundle` | `GRAFANA_CA_BUNDLE` | — | Arquivo PEM da CA interna. |
 | `--insecure` | — | desligado | Não valida o certificado TLS. |
 | `--no-proxy` | — | desligado | Ignora `HTTP(S)_PROXY` do ambiente. |
 | `--timeout` | — | `60` | Timeout por chamada à API (segundos). |
 | `--customer` | — | `Assaí Atacadista` | Nome do cliente exibido nos relatórios. |
 | `--env-name` | — | `Produção` | Nome do ambiente exibido nos relatórios. |
-| `--orgs` | — | todas do usuário | Organizações por nome (curingas `*`, `?`) ou ID, separadas por vírgula. |
+| `--orgs` | — | org do token | Com token, só a org do token é avaliada. Com usuário/senha: organizações por nome (curingas `*`, `?`) ou ID, separadas por vírgula. |
 | `--days` | — | `30` | Janela do histórico de estados de alerta (1 a 365). |
 | `--max-events-per-day` | — | `5000` | Limite de transições de alerta lidas por dia e por org. |
 | `--max-dashboards` | — | `0` (todos) | Analisa no máximo N dashboards por org (ambientes muito grandes). |
@@ -354,7 +407,7 @@ Todos na pasta de saída (padrão `./grafana-assessment-AAAAMMDD-HHMM/`). CSVs u
 | `higiene_otimizacao.csv` | Engenharia | Dashboards, fontes, regras, contact points, silêncios, usuários e tokens a tratar, com consultas/min antes/depois. |
 | `dados.json` | Interno | Dados brutos + checks, scores por domínio/pilar e score global. Base para `--render-only`. |
 
-> ⚠️ **Os arquivos são confidenciais.** Contêm nomes de dashboards, pastas, fontes de dados (com URL), logins de usuários inativos, nomes de service accounts/tokens e topologia do cliente. **Nenhuma senha ou segredo é coletado** (o Grafana mascara segredos na API e o script não lê `secureJsonData`). Tratar conforme a política de dados do cliente e apagar do jump server após a cópia.
+> ⚠️ **Os arquivos são confidenciais.** Contêm nomes de dashboards, pastas, fontes de dados (com URL), logins de usuários inativos, nomes de service accounts/tokens e topologia do cliente. **Nenhuma senha, token ou segredo é coletado**: o token usado na execução não é gravado em nenhum arquivo, o Grafana mascara segredos na API e o script não lê `secureJsonData`. Tratar conforme a política de dados do cliente e apagar do jump server após a cópia.
 
 ---
 
@@ -379,7 +432,7 @@ Todos na pasta de saída (padrão `./grafana-assessment-AAAAMMDD-HHMM/`). CSVs u
 |---|---|---|
 | `ok` | Coletado normalmente. | — |
 | `n/a (endpoint inexistente...)` | Recurso não existe na versão/edição ou está desabilitado. | Nenhuma; é esperado. |
-| `parcial: HTTP 403 ...` | O usuário não tem permissão nesse endpoint. | Ver seção 3 e rodar `--test`. |
+| `parcial: HTTP 403 ...` | A credencial não tem permissão nesse endpoint. Com token, é **esperado** em `admin_settings`, `admin_stats`, `usuarios` e `organizacoes`. | Nos demais, ver seção 3 e rodar `--test`. |
 | `parcial: erro ...` | Erro de rede/timeout em parte das chamadas. | Aumentar `--timeout`, reduzir `--threads`, repetir. |
 | `não executado` | Não havia objetos a consultar (ex.: nenhuma pasta). | — |
 
@@ -392,7 +445,8 @@ Um coletor com falha **não derruba** o assessment: ele é registrado como parci
 - **Fonte inexistente** só é avaliada quando o usuário consegue ler as fontes de dados da org; dashboards que usam variável de datasource (`${ds}`) não são marcados.
 - **Angular:** desabilitado por padrão no Grafana 11 e removido no 12. Painéis `graph`, `singlestat`, `table-old` e plugins Angular aparecem como descontinuados; a prioridade sobe para Alta a partir do 11.
 - **Ciclo de vida da versão:** a regra está embutida no script (constantes `CURRENT_MAJOR` e `LAST_MINOR`): major vigente = suporte completo; última minor do major anterior = limitado; o resto = EOL. Quando o Grafana tem acesso a grafana.com, a versão mais recente informada pela instância é usada. **Revisar as constantes a cada novo major do Grafana.**
-- **Usuário que roda o assessment:** como Grafana Admin, a própria conta `vertare` entra na contagem de Grafana Admins e de contas locais.
+- **Service account do assessment:** a própria service account (e o token dela) entra na contagem de service accounts e tokens; com expiração definida (seção 3.1), não gera o achado "token sem expiração".
+- **Escopo com token:** controles de configuração do servidor (anônimo, política de senha, força bruta, cookies, etc. via `/api/admin/settings`), usuários globais e Grafana Admins ficam N/A. Alguns são parcialmente cobertos por `/api/frontend/settings` (anônimo, formulário de login, LDAP/OAuth/SAML).
 
 ---
 
@@ -401,17 +455,18 @@ Um coletor com falha **não derruba** o assessment: ele é registrado como parci
 | Mensagem | Causa provável | Solução |
 |---|---|---|
 | `informe --url ou GRAFANA_URL` | URL não definida. | Exportar `GRAFANA_URL` ou passar `--url`. |
-| `informe GRAFANA_USER (usuário/senha) ou GRAFANA_TOKEN` | Nenhuma credencial definida. | Exportar `GRAFANA_USER`. Em PowerShell, conferir com `$env:GRAFANA_USER`. |
+| `informe o token (GRAFANA_TOKEN, --token ou prompt) ...` | O prompt do token foi deixado em branco. | Colar o token no prompt ou definir `GRAFANA_TOKEN` (seção 4.1). Em PowerShell, conferir com `[bool]$env:GRAFANA_TOKEN`. |
 | `Erro TLS: ... Use --ca-bundle <ca.pem> ou --insecure.` | Certificado de CA interna/self-signed. | Pedir o PEM da CA ao cliente e usar `--ca-bundle`; em último caso `--insecure`. |
 | `Sem conexão com ...: <motivo>` | VPN, rota, DNS, firewall ou proxy. | Testar `curl -k <URL>/api/health` da mesma máquina (Windows: [seção 5.7](#57-diagnóstico-de-rede)); se houver `HTTPS_PROXY`, usar `--no-proxy`. |
-| `Credencial recusada pelo Grafana (HTTP 401)` | Senha errada, usuário bloqueado por tentativas, Basic auth desabilitado ou conta só OAuth/SAML. | Confirmar a senha antes de repetir (bloqueio após 5 erros em 5 min); validar com o admin `[auth.basic] enabled` e o tipo da conta. |
-| `Credencial sem acesso à organização (HTTP 403...)` | Usuário não é membro de nenhuma organização. | Adicionar o usuário às organizações a avaliar (papel Admin). |
+| `Token recusado pelo Grafana (HTTP 401)` | Token incompleto (quebra de linha/espaço ao colar), expirado, revogado, service account desabilitada, ou SSO/proxy reverso removendo o header `Authorization`. | Testar com a chamada da [seção 5.7](#57-diagnóstico-de-rede); se falhar, pedir um token novo; se o proxy remover o header, pedir liberação de `/api/` com `Authorization` repassado. |
+| `Credencial recusada pelo Grafana (HTTP 401)` (usuário/senha) | Senha errada, usuário bloqueado por tentativas, Basic auth desabilitado ou conta só OAuth/SAML. | Confirmar a senha antes de repetir (bloqueio após 5 erros em 5 min); validar com o admin `[auth.basic] enabled` e o tipo da conta. |
+| `Credencial sem acesso à organização (HTTP 403...)` | Service account sem role na org (ou usuário que não é membro). | Dar papel Admin à service account (seção 3.1) e gerar um novo token. |
 | `resposta não-JSON (a URL aponta para o Grafana? ...)` | URL errada, ou SSO/proxy reverso devolvendo página HTML de login. | Usar a URL raiz do Grafana; pedir liberação do caminho `/api/` sem SSO no proxy. |
-| `--orgs não encontrou organizações ...` | Nome não casa ou o usuário não é membro da org. | Conferir nomes com `--test`; usar curinga (`"NOC*"`) ou o ID. |
+| `--orgs não encontrou organizações ...` | Com token, `--orgs` aponta para uma org diferente da do token. | Remover `--orgs` e usar o token da org desejada (um token por org, seção 4.4). |
 | `--formats inválido: ...` | Valor diferente de `pdf`, `pptx`, `none`. | Corrigir o parâmetro. |
 | `... não gerado: módulo 'reportlab' ausente` (ou `pptx`) | Biblioteca opcional não instalada. | `pip install --user reportlab python-pptx` ou usar `--render-only` em outra máquina. |
 | `caminho '...' bloqueado: assessment somente leitura` | Proteção read-only acionada (não deve ocorrer em uso normal). | Reportar ao mantenedor do script com o log completo. |
-| Execução muito lenta / timeouts | Muitos dashboards, fontes lentas no health check. | `--timeout 120`, `--threads 2`, `--skip-ds-health`, `--max-dashboards`, ou limitar com `--orgs`. |
+| Execução muito lenta / timeouts | Muitos dashboards, fontes lentas no health check. | `--timeout 120`, `--threads 2`, `--skip-ds-health`, `--max-dashboards`. |
 | Ruído/MTTR aparecem N/A | State history em Loki ou desabilitado, ou nenhum disparo na janela. | Confirmar `[unified_alerting.state_history]` com o cliente; é uma limitação, não um erro. |
 
 Erros HTTP 429/5xx e falhas de rede transitórias são **repetidos automaticamente** (até 4 tentativas com espera de 1s, 2s e 4s). Erros de autenticação (401) **não** são repetidos.
@@ -421,10 +476,10 @@ Erros HTTP 429/5xx e falhas de rede transitórias são **repetidos automaticamen
 ## 10. Checklist do suporte
 
 **Antes**
-- [ ] Usuário `vertare` com **Grafana Admin = sim** e papel **Admin** em cada organização a avaliar.
+- [ ] Service account criada com papel **Admin** em cada organização a avaliar e **token com expiração** entregue por canal seguro.
 - [ ] Janela de execução combinada com o cliente (o health check consulta cada fonte de dados uma vez).
 - [ ] Python 3.8+ disponível na máquina de execução.
-- [ ] `--test` executado sem endpoints essenciais `NEGADO`.
+- [ ] `--test` executado sem `NEGADO` além dos esperados com token (`/api/admin/*`, `/api/users/search`, `/api/orgs`).
 
 **Durante**
 - [ ] Rodar com `--customer` e `--env-name` corretos (e `--expected-integrations zabbix` no Assaí).
@@ -434,8 +489,8 @@ Erros HTTP 429/5xx e falhas de rede transitórias são **repetidos automaticamen
 - [ ] Conferir no `relatorio.html` o apêndice de coleta (coletores `parcial`).
 - [ ] Gerar PDF/PPTX (direto ou via `--render-only`).
 - [ ] Copiar a pasta de saída por canal aprovado e **apagar do jump server**.
-- [ ] Solicitar ao cliente que **remova o Grafana Admin** e desabilite o usuário de assessment (ou troque a senha).
-- [ ] Limpar variáveis de ambiente da sessão (`unset GRAFANA_PASSWORD GRAFANA_USER` / `Remove-Item Env:GRAFANA_*`).
+- [ ] Solicitar ao cliente que **revogue o token** e apague (ou desabilite) a service account do assessment.
+- [ ] Limpar variáveis de ambiente da sessão (`unset GRAFANA_TOKEN` / `Remove-Item Env:GRAFANA_TOKEN`).
 
 ---
 
@@ -448,9 +503,9 @@ python3 grafana_assessment.py --help
 
 # variáveis (Assaí)
 export GRAFANA_URL='https://grafana.corp.assai.com.br/'
-export GRAFANA_USER='vertare'
+read -rs -p 'Token do Grafana: ' GRAFANA_TOKEN && export GRAFANA_TOKEN && echo   # cola o token sem exibir
 
-# teste de conexão (pede a senha)
+# teste de conexão (se GRAFANA_TOKEN não estiver definido, o script pede o token)
 python3 grafana_assessment.py --test
 
 # execução padrão
@@ -467,7 +522,7 @@ python3 grafana_assessment.py --render-only ./grafana-assessment-20261126-1600/d
 
 # empacotar o resultado e limpar a sessão
 tar czf grafana-assessment-20261126-1600.tgz grafana-assessment-20261126-1600/
-unset GRAFANA_PASSWORD GRAFANA_USER GRAFANA_URL GRAFANA_CA_BUNDLE
+unset GRAFANA_TOKEN GRAFANA_URL GRAFANA_CA_BUNDLE
 ```
 
 **Windows (PowerShell):** detalhes na [seção 5](#5-execução-no-windows-powershell).
@@ -476,10 +531,12 @@ unset GRAFANA_PASSWORD GRAFANA_USER GRAFANA_URL GRAFANA_CA_BUNDLE
 py .\grafana_assessment.py --help
 
 # variáveis (Assaí)
-$env:GRAFANA_URL  = 'https://grafana.corp.assai.com.br/'
-$env:GRAFANA_USER = 'vertare'
+$env:GRAFANA_URL = 'https://grafana.corp.assai.com.br/'
+$sec = Read-Host 'Token do Grafana' -AsSecureString
+$env:GRAFANA_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+Remove-Variable sec
 
-# teste de conexão (pede a senha)
+# teste de conexão (se GRAFANA_TOKEN não estiver definido, o script pede o token)
 py .\grafana_assessment.py --test
 
 # execução padrão
@@ -496,7 +553,7 @@ py .\grafana_assessment.py --render-only .\grafana-assessment-20261126-1600\dado
 
 # empacotar o resultado e limpar a sessão
 Compress-Archive -Path .\grafana-assessment-20261126-1600 -DestinationPath .\grafana-assessment-20261126-1600.zip
-Remove-Item Env:GRAFANA_PASSWORD, Env:GRAFANA_USER, Env:GRAFANA_URL, Env:GRAFANA_CA_BUNDLE -ErrorAction SilentlyContinue
+Remove-Item Env:GRAFANA_TOKEN, Env:GRAFANA_URL, Env:GRAFANA_CA_BUNDLE -ErrorAction SilentlyContinue
 ```
 
 > Se `python3`/`py` não existir na máquina, use `python` no lugar (ex.: `python grafana_assessment.py --test`).

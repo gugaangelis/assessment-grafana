@@ -20,22 +20,25 @@ Requisitos : Python 3.8+. A COLETA usa só a biblioteca padrão (roda em jump se
              PDF/PPTX (opcionais): `pip install --user reportlab python-pptx`; sem eles, essas saídas são puladas.
              Alternativa: coletar no jump server com --formats none e gerar PDF/PPTX na sua máquina com --render-only.
 Autenticação:
-  Usuário/senha (recomendado, assessment completo): --user/GRAFANA_USER e senha em GRAFANA_PASSWORD ou prompt (HTTP Basic)
-  Service account token                          : --token/GRAFANA_TOKEN (1 organização; sem configurações de servidor)
-Permissão mínima:
-  Usuário com "Grafana Admin" (server admin) = Sim -> lê /api/admin/settings, /api/admin/stats, usuários e organizações;
-  + role Admin em cada organização avaliada -> fontes de dados, alerting, usuários da org, times, service accounts, permissões.
+  Token de API (padrão)  : token de service account (glsa_...) ou API key legada, em GRAFANA_TOKEN, --token ou prompt
+                           oculto (pedido quando nenhuma credencial é informada). Enviado como "Authorization: Bearer".
+  Usuário/senha (opcional): --user/GRAFANA_USER e senha em GRAFANA_PASSWORD ou prompt (HTTP Basic).
+Permissão mínima (token):
+  Service account com role Admin na organização avaliada -> fontes de dados, alerting, usuários da org, times,
+  service accounts, permissões. O token vale para UMA organização (a da service account): o assessment avalia só ela.
+  Service accounts não podem ser "Grafana Admin" (server admin): /api/admin/settings, /api/admin/stats, usuários globais
+  e lista de organizações respondem 403 e esses controles ficam N/A/"parcial" (esperado; o relatório indica).
+  Para cobrir também a configuração do servidor e todas as orgs, use usuário/senha com Grafana Admin = Sim + Admin nas orgs.
   O Grafana OSS não tem role de administrador somente leitura: a garantia de read-only é do próprio script (abaixo).
   Grafana Enterprise/Cloud: pode-se usar uma role RBAC customizada só com ações *:read.
-  Com Editor/Viewer o assessment roda, mas coletores restritos aparecem como "parcial" no apêndice e os controles ficam N/A.
-  Basic auth precisa estar habilitado ([auth.basic] enabled = true). Usuário LDAP funciona; usuário só OAuth/SAML não.
+  Com role Editor/Viewer o assessment roda, mas coletores restritos aparecem como "parcial" e os controles ficam N/A.
 
 Garantia de read-only: o cliente HTTP só implementa GET em caminhos /api/...; proxy de datasource, /api/ds/* e recursos de
-plugins são bloqueados antes de sair da máquina. Basic auth não cria sessão (nada a encerrar). Único efeito: o health check
-das fontes de dados executa a consulta de teste de cada fonte (desligue com --skip-ds-health).
+plugins são bloqueados antes de sair da máquina. Token/Basic não criam sessão (nada a encerrar). Único efeito: o health
+check das fontes de dados executa a consulta de teste de cada fonte (desligue com --skip-ds-health).
 
 Uso:
-  export GRAFANA_URL='https://grafana.interno/' ; export GRAFANA_USER='svc_assessment'     (senha pedida no prompt)
+  export GRAFANA_URL='https://grafana.interno/' ; export GRAFANA_TOKEN='glsa_...'   (ou omita e cole no prompt oculto)
   python3 grafana_assessment.py --test                                    (valida conexão e permissões e sai)
   python3 grafana_assessment.py --customer "Assaí Atacadista" --env-name "Produção" --days 30
   python3 grafana_assessment.py --insecure --no-proxy --formats none      (certificado interno, sem proxy, sem PDF/PPTX)
@@ -236,6 +239,9 @@ def signal_of(ds_type: str) -> str:
 DENY_RE = re.compile(r"^/api/(ds/|datasources/(proxy|uid/[^/]+/resources|[^/]+/resources)|plugins/[^/]+/resources|plugin-proxy/)", re.I)
 
 
+AUTH_LBL = {"token_api": "Token de API (service account)", "service_account_token": "Token de API (service account)", "usuario_senha": "Usuário/senha"}
+
+
 class GfError(Exception):
     def __init__(self, path: str, status: int, message: str = ""):
         super().__init__(f"{path}: HTTP {status} {message}".strip())
@@ -257,13 +263,17 @@ class Grafana:
             handlers.append(urllib.request.ProxyHandler({}))
         self._op = urllib.request.build_opener(*handlers)
         self.timeout, self.stats = timeout, Counter()
+        token = (token or "").strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
         if token:
-            self._auth, self.auth_mode = "Bearer " + token, "service_account_token"
+            self._auth, self.auth_mode = "Bearer " + token, "token_api"
         elif user:
             self._auth = "Basic " + base64.b64encode(f"{user}:{password or ''}".encode("utf-8")).decode("ascii")
             self.auth_mode = "usuario_senha"
         else:
-            raise ValueError("informe --user/GRAFANA_USER ou --token/GRAFANA_TOKEN")
+            raise ValueError("informe --token/GRAFANA_TOKEN ou --user/GRAFANA_USER")
+        self.token_mode = self.auth_mode == "token_api"
         try:
             self.health = self._get("/api/health", auth=False) or {}
         except GfError:  # health anônimo bloqueado por proxy/SSO: segue sem ele
@@ -274,7 +284,7 @@ class Grafana:
         hdr = {"Accept": "application/json", "User-Agent": "grafana-assessment/1.0"}
         if auth:
             hdr["Authorization"] = self._auth
-        if org:
+        if org and not self.token_mode:  # token já é da org da service account; trocar de org com token dá 401
             hdr["X-Grafana-Org-Id"] = str(org)
         raw = ""
         tries = 4 if retry else 1
@@ -439,7 +449,14 @@ def collect_users(G: Grafana, E: Errors) -> list[dict] | None:
 
 
 def collect_orgs(G: Grafana, E: Errors, patterns: list[str]) -> tuple[list[dict], list[dict] | None]:
-    mine = E.run("organizacoes", lambda: G.get("/api/user/orgs"), None)
+    mine = None
+    if G.token_mode:  # token = uma org (a da service account/API key)
+        cur = E.run("organizacoes", lambda: G.get("/api/org"), {}) or {}
+        role = next((o.get("role") for o in E.run("organizacoes", lambda: G.get("/api/user/orgs"), None) or []
+                     if o.get("orgId") == cur.get("id")), None)
+        mine = [{"orgId": cur.get("id", 1), "name": cur.get("name", "Main Org."), "role": role}]
+    else:
+        mine = E.run("organizacoes", lambda: G.get("/api/user/orgs"), None)
     if not mine:
         cur = E.run("organizacoes", lambda: G.get("/api/org"), {}) or {}
         mine = [{"orgId": cur.get("id", 1), "name": cur.get("name", "Main Org."), "role": None}]
@@ -449,7 +466,8 @@ def collect_orgs(G: Grafana, E: Errors, patterns: list[str]) -> tuple[list[dict]
     if pats:
         sel = [o for o in sel if any(fnmatch.fnmatch(str(o["nome"]).lower(), p) or str(o["id"]) == p for p in pats)]
         if not sel:
-            raise SystemExit(f"--orgs não encontrou organizações (das que o usuário é membro) para: {', '.join(patterns)}")
+            raise SystemExit(f"--orgs não encontrou organizações (das que o usuário é membro) para: {', '.join(patterns)}"
+                             + (f". Com token, só a org do token ({mine[0].get('name')}) é avaliável: gere um token em cada org." if G.token_mode else ""))
     return sel, None if allo is None else [{"id": o.get("id"), "nome": o.get("name")} for o in allo]
 
 
@@ -2216,7 +2234,7 @@ def build_pdf_tech(d: dict, checks: list[Check], dom: dict[str, int], pil: dict[
     story.append(_pdf_side([[T(["Item", "Valor"], [
         ["Cliente", customer], ["Ambiente", M["ambiente"]], ["Endpoint", M["url_host"]], ["Versão", f"{PL['versao']} ({PL['edicao']})"],
         ["Organizações avaliadas", ", ".join(o["nome"] for o in PL["orgs_avaliadas"])], ["Dashboards (analisados / total)", f"{DR['analisados']} / {DR['total']}"],
-        ["Janela de histórico de alertas", f"{days} dias"], ["Autenticação", M.get("auth", "-")], ["Usuário Grafana Admin", yn(M.get("server_admin"))],
+        ["Janela de histórico de alertas", f"{days} dias"], ["Autenticação", AUTH_LBL.get(M.get("auth"), M.get("auth", "-"))], ["Usuário Grafana Admin", yn(M.get("server_admin"))],
         ["Chamadas de API (leitura)", M.get("chamadas_api", "-")], ["Duração da coleta", f"{M.get('duracao_s', '-')} s"], ["Gerado em", M["gerado_em"]]], H, [1, 2])],
         [P("<b>Abordagem.</b> Coleta 100% somente leitura via HTTP API: o cliente só executa GET em /api/... e bloqueia proxies de fonte de dados e "
            "recursos de plugin. Os dados são avaliados contra controles de cinco pilares de maturidade de observabilidade."),
@@ -2224,7 +2242,7 @@ def build_pdf_tech(d: dict, checks: list[Check], dom: dict[str, int], pil: dict[
                          f"Foram avaliados {len(x['evaluated'])} controles: {len(x['oks'])} atendidos e {len(x['fails'])} lacunas."),
          Spacer(1, 6), P("<b>Níveis.</b> Inicial (&lt;40) · Em desenvolvimento (40–64) · Estruturado (65–84) · Otimizado (≥85)."),
          Spacer(1, 6), P("<b>Limitações.</b> Ruído e MTTR vêm do histórico de estados (anotações de alerta); se o state history estiver em Loki ou "
-                         "desabilitado, esses controles ficam N/A. Configuração do servidor exige Grafana Admin. Consultas/min são estimadas pela "
+                         "desabilitado, esses controles ficam N/A. Configuração do servidor exige Grafana Admin" + (" (indisponível para token de API: avaliada só a org do token)" if M.get("auth") == "token_api" else "") + ". Consultas/min são estimadas pela "
                          "configuração (intervalo/refresh). Coletores 'parcial' (Apêndice A) indicam permissões ausentes.")]], W))
     h2("2. Maturidade por pilar")
     story += [P(exec_summary(d, x, e=_xe)), Spacer(1, 8),
@@ -2879,10 +2897,11 @@ def run_test(G: Grafana, E: Errors) -> int:
     inst = collect_instance(G, E)
     me, sp = inst["me"], inst["suporte"]
     print(f"Conectado: {G.base}\nVersão: {inst['versao']} ({inst['edicao']}) · suporte {sp['status']} · autenticação: {G.auth_mode} · banco: {G.health.get('database', 'N/D')}")
-    print(f"Usuário: {me.get('login') or '-'} · Grafana Admin (server admin): {'sim' if me.get('server_admin') else 'NÃO'}")
-    orgs = E.run("organizacoes", lambda: G.get("/api/user/orgs"), []) or []
+    print(f"{'Identidade (service account)' if G.token_mode else 'Usuário'}: {me.get('login') or '-'} · "
+          f"Grafana Admin (server admin): {'sim' if me.get('server_admin') else 'NÃO'}")
+    orgs, _ = collect_orgs(G, E, [])
     for o in orgs:
-        print(f"  org {o.get('orgId')}: {o.get('name')} · papel {o.get('role')}" + ("" if o.get("role") == "Admin" else "  <- recomendado Admin"))
+        print(f"  org {o.get('id')}: {o.get('nome')} · papel {o.get('papel') or 'N/D'}" + ("" if o.get("papel") == "Admin" else "  <- recomendado Admin"))
     print(f"Endpoints (org atual {me.get('org_id') or '-'}):")
     for path, params, what in PROBES:
         try:
@@ -2898,17 +2917,23 @@ def run_test(G: Grafana, E: Errors) -> int:
             raise
         except Exception as e:  # noqa: BLE001
             print(f"  {path:<52} ERRO  {type(e).__name__}: {clip(e, 60)}  · {what}")
-    if not me.get("server_admin"):
-        print("Aviso: sem Grafana Admin, configuração do servidor, usuários globais e demais organizações ficam 'parcial'/N/A.")
-    print("Se algum endpoint aparecer NEGADO, ajuste o usuário (Grafana Admin = sim + Admin em cada org avaliada) antes de rodar.")
+    if G.token_mode:
+        print("Token de API: escopo de 1 organização e sem Grafana Admin. NEGADO em /api/admin/*, /api/users/search e /api/orgs é "
+              "esperado (configuração do servidor, usuários globais e demais orgs ficarão N/A/'parcial').")
+        print("Se outros endpoints aparecerem NEGADO, dê role Admin à service account na organização e gere um novo token.")
+    else:
+        if not me.get("server_admin"):
+            print("Aviso: sem Grafana Admin, configuração do servidor, usuários globais e demais organizações ficam 'parcial'/N/A.")
+        print("Se algum endpoint aparecer NEGADO, ajuste o usuário (Grafana Admin = sim + Admin em cada org avaliada) antes de rodar.")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Assessment read-only de ambiente Grafana (9.x–12.x)")
     ap.add_argument("--url", default=os.getenv("GRAFANA_URL"), help="URL do Grafana, ex.: https://grafana.interno/ (ou GRAFANA_URL)")
-    ap.add_argument("--user", default=os.getenv("GRAFANA_USER"), help="Usuário (ou GRAFANA_USER); senha via GRAFANA_PASSWORD ou prompt")
-    ap.add_argument("--token", default=os.getenv("GRAFANA_TOKEN"), help="Service account token (ou GRAFANA_TOKEN); escopo de 1 org")
+    ap.add_argument("--token", default=os.getenv("GRAFANA_TOKEN"),
+                    help="Token de API: service account (glsa_...) ou API key (prefira GRAFANA_TOKEN ou o prompt oculto; escopo de 1 org)")
+    ap.add_argument("--user", default=os.getenv("GRAFANA_USER"), help="Alternativa ao token: usuário (ou GRAFANA_USER); senha via GRAFANA_PASSWORD ou prompt")
     ap.add_argument("--insecure", action="store_true", help="Não valida o certificado TLS (CA interna/self-signed)")
     ap.add_argument("--ca-bundle", default=os.getenv("GRAFANA_CA_BUNDLE"), help="Arquivo PEM da CA interna (alternativa ao --insecure)")
     ap.add_argument("--no-proxy", action="store_true", help="Ignora HTTP(S)_PROXY do ambiente (acesso direto pela VPN)")
@@ -2939,10 +2964,12 @@ def main() -> int:
 
     if not a.url:
         ap.error("informe --url ou GRAFANA_URL")
-    if not a.token and not a.user:
-        ap.error("informe GRAFANA_USER (usuário/senha) ou GRAFANA_TOKEN")
     password = None
-    if not a.token:
+    if not a.token and not a.user:
+        a.token = getpass.getpass("Token de API do Grafana (service account glsa_... ; entrada oculta): ").strip()
+        if not a.token:
+            ap.error("informe o token (GRAFANA_TOKEN, --token ou prompt) ou, alternativamente, GRAFANA_USER")
+    elif not a.token:
         password = os.getenv("GRAFANA_PASSWORD") or getpass.getpass(f"Senha do usuário {a.user}: ")
     try:
         G = Grafana(a.url, token=a.token, user=a.user, password=password, insecure=a.insecure, ca=a.ca_bundle, timeout=a.timeout, no_proxy=a.no_proxy)
@@ -2958,10 +2985,16 @@ def main() -> int:
     try:
         G.get("/api/org", retry=False)
     except GfError as e:
+        if e.status == 401 and G.token_mode:
+            sys.exit("Token recusado pelo Grafana (HTTP 401). Confira se o token foi copiado inteiro (sem espaços/quebras), se não expirou, "
+                     "não foi revogado e se a service account não está desabilitada. Se houver SSO/proxy na frente, ele precisa repassar "
+                     "o header Authorization.")
         if e.status == 401:
             sys.exit("Credencial recusada pelo Grafana (HTTP 401). Confira usuário/senha, se [auth.basic] está habilitado e se o usuário não é "
                      "somente OAuth/SAML. Não repita várias vezes: o Grafana bloqueia o login após 5 tentativas erradas em 5 minutos.")
-        sys.exit(f"Credencial sem acesso à organização (HTTP {e.status} {e.message}). O usuário precisa ser membro de ao menos uma organização.")
+        sys.exit(f"Credencial sem acesso à organização (HTTP {e.status} {e.message}). "
+                 + ("A service account precisa de uma role (recomendado Admin) na organização." if G.token_mode
+                    else "O usuário precisa ser membro de ao menos uma organização."))
     E = Errors()
     if a.test:
         return run_test(G, E)
@@ -2971,7 +3004,9 @@ def main() -> int:
     log(f"Grafana {G.health.get('version') or ''} · auth={G.auth_mode} · {G.base}")
     log("instância (versão, configuração, estatísticas, plugins, usuários, organizações)...")
     inst = collect_instance(G, E)
-    if not inst["me"].get("server_admin") and G.auth_mode == "usuario_senha":
+    if G.token_mode:
+        log("token de API: avalia só a org do token; configuração do servidor, usuários globais e outras orgs ficarão N/A (esperado)")
+    elif not inst["me"].get("server_admin"):
         log("aviso: usuário sem Grafana Admin -> configuração do servidor, usuários globais e outras orgs ficarão parciais")
     users = collect_users(G, E)
     orgs, allo = collect_orgs(G, E, [x for x in (a.orgs or "").split(",") if x.strip()])
@@ -2986,7 +3021,7 @@ def main() -> int:
     inst["orgs_sem_acesso"] = None if allo is None else [o for o in allo if o["id"] not in ids]
     d: dict[str, Any] = {"meta": {"days": days, "coleta": {}, "gerado_em": datetime.now().strftime("%d/%m/%Y %H:%M"), "ambiente": a.env_name,
                                   "url": G.base, "url_host": url_host, "auth": G.auth_mode, "server_admin": inst["me"].get("server_admin"),
-                                  "escopo_orgs": a.orgs or "todas do usuário", "max_dashboards": a.max_dashboards,
+                                  "escopo_orgs": a.orgs or ("org do token" if G.token_mode else "todas do usuário"), "max_dashboards": a.max_dashboards,
                                   "expected_integrations": [x.strip().lower() for x in a.expected_integrations.split(",") if x.strip()]},
                          "platform": inst}
     consolidate(d, inst, users, results, d["meta"]["expected_integrations"])
